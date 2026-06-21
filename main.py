@@ -30,7 +30,7 @@ PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 if not PUBLIC_URL:
     PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000")
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1/models"
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 app = FastAPI(title="Chatbot AI Proxy", version="1.1.0")
 
@@ -137,7 +137,7 @@ async def health():
                     params={"key": GEMINI_API_KEY, "pageSize": 20},
                 )
             if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", [])]
+                models = [m["name"] for m in r.json().get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
                 info["available_models"] = models
             else:
                 info["models_error"] = f"{r.status_code}: {r.text[:100]}"
