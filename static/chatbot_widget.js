@@ -187,9 +187,6 @@
     }
 
     if (!modelName) return { type: "error", content: "Modèle non spécifié." };
-    if (!state.availableModels.includes(modelName)) {
-      return { type: "error", content: `Modèle "${modelName}" non disponible.` };
-    }
 
     const domain = intent.domain || [];
 
