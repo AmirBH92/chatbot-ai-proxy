@@ -7,6 +7,7 @@ Endpoints :
   GET  /widget.js  -- sert le widget avec l'URL du proxy integree
   GET  /health     -- healthcheck
 """
+import asyncio
 import json
 import os
 from datetime import datetime, timedelta
@@ -189,14 +190,22 @@ async def query(req: QueryRequest):
     }
 
     endpoint = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent"
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            endpoint,
-            params={"key": GEMINI_API_KEY},
-            json=payload,
-        )
+    resp = None
+    for attempt, wait in enumerate([0, 5, 15]):
+        if wait:
+            await asyncio.sleep(wait)
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                endpoint,
+                params={"key": GEMINI_API_KEY},
+                json=payload,
+            )
+        if resp.status_code != 429:
+            break
 
     if resp.status_code != 200:
+        if resp.status_code == 429:
+            raise HTTPException(503, detail="Le service IA est temporairement surchargee. Reessayez dans 30 secondes.")
         raise HTTPException(502, detail=f"Gemini error {resp.status_code}: {resp.text[:300]}")
 
     data = resp.json()

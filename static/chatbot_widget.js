@@ -304,7 +304,12 @@
       });
 
       if (!proxyResp.ok) {
-        throw new Error(`Proxy error ${proxyResp.status}`);
+        let errMsg = `Erreur ${proxyResp.status}`;
+        try {
+          const errBody = await proxyResp.json();
+          errMsg = errBody.detail || errMsg;
+        } catch (_) {}
+        throw new Error(errMsg);
       }
 
       const intent = await proxyResp.json();
