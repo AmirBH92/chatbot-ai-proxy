@@ -30,10 +30,7 @@ PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 if not PUBLIC_URL:
     PUBLIC_URL = os.environ.get("PUBLIC_URL", "http://localhost:8000")
 
-GEMINI_ENDPOINT = (
-    f"https://generativelanguage.googleapis.com/v1beta/models"
-    f"/{GEMINI_MODEL}:generateContent"
-)
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1/models"
 
 app = FastAPI(title="Chatbot AI Proxy", version="1.1.0")
 
@@ -129,8 +126,24 @@ class QueryRequest(BaseModel):
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "model": GEMINI_MODEL, "configured": bool(GEMINI_API_KEY)}
+async def health():
+    info = {"status": "ok", "model": GEMINI_MODEL, "configured": bool(GEMINI_API_KEY)}
+    if GEMINI_API_KEY:
+        # Lister les modeles disponibles pour cette cle
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"https://generativelanguage.googleapis.com/v1/models",
+                    params={"key": GEMINI_API_KEY, "pageSize": 20},
+                )
+            if r.status_code == 200:
+                models = [m["name"] for m in r.json().get("models", [])]
+                info["available_models"] = models
+            else:
+                info["models_error"] = f"{r.status_code}: {r.text[:100]}"
+        except Exception as e:
+            info["models_error"] = str(e)
+    return info
 
 
 @app.post("/api/query")
@@ -175,9 +188,10 @@ async def query(req: QueryRequest):
         },
     }
 
+    endpoint = f"{GEMINI_BASE}/{GEMINI_MODEL}:generateContent"
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            GEMINI_ENDPOINT,
+            endpoint,
             params={"key": GEMINI_API_KEY},
             json=payload,
         )
