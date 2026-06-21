@@ -117,16 +117,23 @@
     return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(v);
   }
 
-  // ── Odoo API (browser session) ────────────────────────────────────────────
+  // ── Odoo API (browser session via /web/dataset/call_kw) ──────────────────
   async function odooCall(model, method, kw = {}) {
-    const resp = await fetch(`${ODOO_URL}/json/2/${model}/${method}`, {
+    const resp = await fetch(`${ODOO_URL}/web/dataset/call_kw`, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify(kw),
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "call",
+        id: Date.now(),
+        params: { model, method, args: [], kwargs: kw },
+      }),
     });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    return resp.json();
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.data?.message || data.error.message || "Odoo error");
+    return data.result;
   }
 
   // ── Initialisation : sonder modèles disponibles + user ───────────────────
