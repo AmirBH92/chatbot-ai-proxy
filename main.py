@@ -200,11 +200,11 @@ async def query(req: QueryRequest):
                 params={"key": GEMINI_API_KEY},
                 json=payload,
             )
-        if resp.status_code != 429:
+        if resp.status_code not in (429, 503):
             break
 
     if resp.status_code != 200:
-        if resp.status_code == 429:
+        if resp.status_code in (429, 503):
             raise HTTPException(503, detail="Le service IA est temporairement surchargee. Reessayez dans 30 secondes.")
         raise HTTPException(502, detail=f"Gemini error {resp.status_code}: {resp.text[:300]}")
 
