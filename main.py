@@ -109,24 +109,13 @@ class QueryRequest(BaseModel):
 
 
 @app.get("/health")
-async def health():
-    info = {"status": "ok", "model": GEMINI_MODEL, "configured": bool(GEMINI_API_KEY)}
-    if GEMINI_API_KEY:
-        # Lister les modeles disponibles pour cette cle
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1/models",
-                    params={"key": GEMINI_API_KEY, "pageSize": 20},
-                )
-            if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", []) if "generateContent" in m.get("supportedGenerationMethods", [])]
-                info["available_models"] = models
-            else:
-                info["models_error"] = f"{r.status_code}: {r.text[:100]}"
-        except Exception as e:
-            info["models_error"] = str(e)
-    return info
+def health():
+    return {
+        "status": "ok",
+        "model": GEMINI_MODEL,
+        "configured": bool(GEMINI_API_KEY),
+        "odoo": bool(ODOO_URL and ODOO_API_KEY),
+    }
 
 
 @app.post("/api/query")
