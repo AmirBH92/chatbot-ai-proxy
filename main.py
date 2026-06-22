@@ -10,6 +10,7 @@ Endpoints :
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -25,6 +26,8 @@ load_dotenv()
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL    = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "https://chatbot.odoo.com").split(",")
+ODOO_URL        = os.environ.get("ODOO_URL", "").rstrip("/")
+ODOO_API_KEY    = os.environ.get("ODOO_API_KEY", "")
 
 # URL publique du proxy
 PUBLIC_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
@@ -200,4 +203,214 @@ async def query(req: QueryRequest):
         return JSONResponse({"type": "message", "message": "Le service IA n'a pas retourne de reponse valide. Reessayez."})
     _ = finish_reason  # utilisé si besoin de log futur
 
-    return JSONResponse(intent)
+    # ── Exécution Odoo côté serveur ──────────────────────────────────────────
+    async with httpx.AsyncClient(timeout=30) as odoo_client:
+        result = await execute_odoo(odoo_client, intent)
+    return JSONResponse(result)
+
+
+# ── Helpers Odoo server-side ──────────────────────────────────────────────────
+
+async def odoo_call(client: httpx.AsyncClient, model: str, method: str, **kwargs):
+    if not ODOO_URL or not ODOO_API_KEY:
+        raise HTTPException(503, detail="ODOO_URL ou ODOO_API_KEY non configure sur le proxy.")
+    resp = await client.post(
+        f"{ODOO_URL}/json/2/{model}/{method}",
+        headers={"Authorization": f"Bearer {ODOO_API_KEY}", "Content-Type": "application/json"},
+        json=kwargs,
+    )
+    if not resp.is_success:
+        raise HTTPException(502, detail=f"Odoo {model}.{method} error {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    if isinstance(data, dict) and "error" in data:
+        msg = data["error"].get("data", {}).get("message") or data["error"].get("message", str(data["error"]))
+        raise HTTPException(502, detail=f"Odoo error: {msg[:200]}")
+    return data
+
+
+def resolve_domain(domain: list, ctx: dict) -> list:
+    out = []
+    for cond in domain:
+        if isinstance(cond, list) and len(cond) == 3:
+            f, op, v = cond
+            if isinstance(v, str) and v.startswith("$"):
+                v = ctx.get(v[1:], v)
+            out.append([f, op, v])
+        else:
+            out.append(cond)
+    return out
+
+
+def eval_formula(formula: str, ctx: dict) -> float:
+    expr = formula
+    for k, v in ctx.items():
+        if isinstance(v, (int, float)):
+            expr = re.sub(r"\$" + re.escape(k) + r"\b", str(v), expr)
+    if not re.match(r"^[\d+\-*/().\s]+$", expr):
+        return 0.0
+    try:
+        result = eval(expr)  # noqa: S307 — formule arithmetique uniquement
+        return float(result) if result else 0.0
+    except Exception:
+        return 0.0
+
+
+def fmt_records(records: list) -> list:
+    out = []
+    for rec in records:
+        row = {}
+        for k, v in rec.items():
+            if isinstance(v, list) and len(v) == 2 and isinstance(v[0], int):
+                row[k] = v[1]
+            elif v is False:
+                row[k] = None
+            else:
+                row[k] = v
+        out.append(row)
+    return out
+
+
+async def execute_chart(client: httpx.AsyncClient, intent: dict) -> dict:
+    groupby = intent.get("groupby", [])
+    field   = intent.get("field", "amount_total")
+    if not groupby:
+        return {"type": "chart", "chart_type": "bar", "labels": [], "values": [], "title": intent.get("title", "")}
+
+    groups = await odoo_call(client, intent["model"], "read_group",
+                             domain=intent.get("domain", []),
+                             fields=[field],
+                             groupby=groupby,
+                             lazy=False)
+
+    label_fld = groupby[0]
+    pairs = []
+    for g in groups:
+        lbl = g.get(label_fld, "N/A")
+        if isinstance(lbl, list): lbl = lbl[1] if len(lbl) > 1 else lbl[0]
+        if lbl is False or lbl is None: lbl = "Non défini"
+        pairs.append((str(lbl), round(g.get(field, 0) * 100) / 100))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    pairs = pairs[:15]
+
+    return {
+        "type": "chart",
+        "chart_type": intent.get("chart_type", "bar"),
+        "labels": [p[0] for p in pairs],
+        "values": [p[1] for p in pairs],
+        "title":   intent.get("title", ""),
+        "x_label": intent.get("x_label", ""),
+        "y_label": intent.get("y_label", ""),
+    }
+
+
+async def execute_odoo(client: httpx.AsyncClient, intent: dict) -> dict:
+    t = intent.get("type", "query")
+
+    if t == "message":
+        return intent
+
+    if t == "count":
+        n = await odoo_call(client, intent["model"], "search_count",
+                            domain=intent.get("domain", []))
+        return {"type": "count", "value": n, "title": intent.get("title", "")}
+
+    if t == "sum":
+        field  = intent.get("field", "amount_total")
+        groups = await odoo_call(client, intent["model"], "read_group",
+                                 domain=intent.get("domain", []),
+                                 fields=[field], groupby=[], lazy=False)
+        total = groups[0].get(field, 0) if groups else 0
+        return {"type": "sum", "value": total, "title": intent.get("title", ""), "unit": intent.get("unit", "")}
+
+    if t == "query":
+        fields  = intent.get("fields", ["name"])
+        records = await odoo_call(client, intent["model"], "search_read",
+                                  domain=intent.get("domain", []),
+                                  fields=fields,
+                                  order=intent.get("orderby", "id desc"),
+                                  limit=min(int(intent.get("limit", 10)), 100))
+        return {"type": "query", "records": fmt_records(records), "fields": fields,
+                "field_labels": intent.get("field_labels", {}),
+                "title": intent.get("title", ""), "total": len(records)}
+
+    if t == "chart":
+        return await execute_chart(client, intent)
+
+    if t == "synthesis":
+        kpis = []
+        for kpi in intent.get("kpis", []):
+            method = kpi.get("method", "count")
+            if method == "count":
+                v = await odoo_call(client, kpi["model"], "search_count",
+                                    domain=kpi.get("domain", []))
+                kpis.append({"label": kpi["label"], "value": v, "unit": "", "valueType": "count"})
+            else:
+                field  = kpi.get("field", "amount_total")
+                groups = await odoo_call(client, kpi["model"], "read_group",
+                                         domain=kpi.get("domain", []),
+                                         fields=[field], groupby=[], lazy=False)
+                total = groups[0].get(field, 0) if groups else 0
+                kpis.append({"label": kpi["label"], "value": total, "unit": kpi.get("unit", "EUR"), "valueType": "sum"})
+
+        chart_data = None
+        if intent.get("chart"):
+            chart_data = await execute_chart(client, intent["chart"])
+
+        return {"type": "synthesis", "title": intent.get("title", ""), "kpis": kpis, "chartData": chart_data}
+
+    if t == "multi":
+        ctx   = {}
+        items = []
+        for step in intent.get("steps", []):
+            st     = step.get("type")
+            domain = resolve_domain(step.get("domain", []), ctx)
+            show   = step.get("display", True)
+
+            if st == "collect":
+                field = step.get("field", "partner_id")
+                recs  = await odoo_call(client, step["model"], "search_read",
+                                        domain=domain, fields=[field], limit=2000)
+                ids = list({
+                    r[field][0] if isinstance(r[field], list) else r[field]
+                    for r in recs if r[field] not in (False, None)
+                })[:500]
+                ctx[step["id"]] = ids
+
+            elif st == "sum":
+                field  = step.get("field", "amount_total")
+                groups = await odoo_call(client, step["model"], "read_group",
+                                         domain=domain, fields=[field], groupby=[], lazy=False)
+                val = groups[0].get(field, 0) if groups else 0
+                ctx[step["id"]] = val
+                if show: items.append({"type": "kpi", "label": step.get("label", ""), "value": val, "unit": step.get("unit", "EUR")})
+
+            elif st == "count":
+                val = await odoo_call(client, step["model"], "search_count", domain=domain)
+                ctx[step["id"]] = val
+                if show: items.append({"type": "kpi", "label": step.get("label", ""), "value": val, "unit": ""})
+
+            elif st == "calc":
+                val = eval_formula(step.get("formula", "0"), ctx)
+                ctx[step["id"]] = val
+                if show: items.append({"type": "calc", "label": step.get("label", ""), "value": val, "unit": step.get("unit", "")})
+
+            elif st == "query":
+                fields  = step.get("fields", ["name"])
+                recs    = await odoo_call(client, step["model"], "search_read",
+                                          domain=domain, fields=fields,
+                                          order=step.get("orderby", "id desc"),
+                                          limit=min(int(step.get("limit", 15)), 100))
+                fmt = fmt_records(recs)
+                ctx[step["id"]] = fmt
+                if show: items.append({"type": "query", "title": step.get("label", ""),
+                                        "fields": fields, "field_labels": step.get("field_labels", {}),
+                                        "records": fmt, "total": len(fmt)})
+
+            elif st == "chart":
+                cd = await execute_chart(client, {**step, "domain": domain})
+                ctx[step["id"]] = cd
+                if show: items.append(cd)
+
+        return {"type": "multi", "title": intent.get("title", ""), "items": items}
+
+    return {"type": "error", "content": f"Type non reconnu : {t}"}

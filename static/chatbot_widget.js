@@ -210,190 +210,17 @@
     renderWelcome();
   }
 
-  // ── Construit les données d'un chart via search_read + agrégation JS ────
-  async function buildChartData(c) {
-    const groupByField = (c.groupby || [])[0] || "state";
-    const field = c.field || "amount_total";
-    const records = await odooCall(c.model, "search_read", {
-      domain: c.domain || [], fields: [field, groupByField], limit: 1000,
-    });
-    const grouped = {};
-    for (const rec of records) {
-      let lbl = rec[groupByField];
-      if (Array.isArray(lbl)) lbl = lbl[1] ?? lbl[0];
-      if (lbl === false || lbl === null || lbl === undefined) lbl = "Non défini";
-      lbl = String(lbl);
-      if (STATE_LABELS[lbl]) lbl = STATE_LABELS[lbl];
-      grouped[lbl] = (grouped[lbl] || 0) + (rec[field] || 0);
-    }
-    const sorted = Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, 15);
-    return {
-      chart_type: c.chart_type || "bar",
-      labels: sorted.map(e => e[0]),
-      values: sorted.map(e => Math.round(e[1] * 100) / 100),
-      title: c.title || "", x_label: c.x_label || "", y_label: c.y_label || "",
-    };
-  }
-
-  // ── Résout les références $step_id dans un domain ────────────────────────
-  function buildDomain(domain, ctx) {
-    return domain.map(cond => {
-      if (!Array.isArray(cond) || cond.length !== 3) return cond;
-      const [f, op, v] = cond;
-      if (typeof v === "string" && v.startsWith("$")) {
-        const ref = v.slice(1);
-        return [f, op, ctx[ref] ?? v];
-      }
-      return cond;
-    });
-  }
-
-  // ── Évalue une formule arithmétique simple ────────────────────────────────
-  function evalFormula(formula, ctx) {
-    let expr = formula;
-    for (const [k, v] of Object.entries(ctx)) {
-      if (typeof v === "number") expr = expr.replace(new RegExp("\\$" + k + "\\b", "g"), v);
-    }
-    if (!/^[\d+\-*/().\s]+$/.test(expr)) return 0;
-    try { return eval(expr); } catch { return 0; }
-  }
-
-  // ── Exécution multi-étapes ────────────────────────────────────────────────
-  async function executeMultiIntent(intent) {
-    const ctx   = {};   // résultats intermédiaires par id
-    const items = [];   // éléments à afficher
-
-    for (const step of (intent.steps || [])) {
-      const domain = buildDomain(step.domain || [], ctx);
-      const show   = step.display !== false;
-
-      if (step.type === "collect") {
-        const recs = await odooCall(step.model, "search_read", { domain, fields: [step.field], limit: 2000 });
-        ctx[step.id] = [...new Set(recs.map(r => {
-          const v = r[step.field]; return Array.isArray(v) ? v[0] : v;
-        }).filter(v => v !== false && v !== null && v !== undefined))].slice(0, 500);
-
-      } else if (step.type === "sum") {
-        const recs = await odooCall(step.model, "search_read", { domain, fields: [step.field], limit: 2000 });
-        const val  = recs.reduce((a, r) => a + (r[step.field] || 0), 0);
-        ctx[step.id] = val;
-        if (show) items.push({ type: "kpi", label: step.label, value: val, unit: step.unit || "EUR" });
-
-      } else if (step.type === "count") {
-        const val = await odooCall(step.model, "search_count", { domain });
-        ctx[step.id] = val;
-        if (show) items.push({ type: "kpi", label: step.label, value: val, unit: "" });
-
-      } else if (step.type === "calc") {
-        const val = evalFormula(step.formula, ctx);
-        ctx[step.id] = val;
-        if (show) items.push({ type: "calc", label: step.label, value: val, unit: step.unit || "" });
-
-      } else if (step.type === "query") {
-        const fields = step.fields || ["name"];
-        const recs   = await odooCall(step.model, "search_read", { domain, fields, order: step.orderby || "id desc", limit: step.limit || 15 });
-        const fmt_recs = recs.map(rec => {
-          const row = {};
-          for (const [k, v] of Object.entries(rec)) row[k] = Array.isArray(v) && v.length === 2 ? v[1] : (v === false ? null : v);
-          return row;
-        });
-        ctx[step.id] = fmt_recs;
-        if (show) items.push({ type: "query", title: step.label, fields, field_labels: step.field_labels || {}, records: fmt_recs, total: fmt_recs.length });
-
-      } else if (step.type === "chart") {
-        const cd = await buildChartData({ ...step, domain });
-        ctx[step.id] = cd;
-        if (show) items.push({ type: "chart", ...cd, id: state.nextId++ });
+  // ── Assigne des IDs canvas aux résultats contenant des graphiques ─────────
+  function assignChartIds(result) {
+    if (result.type === "chart") result.id = state.nextId++;
+    if (result.type === "synthesis" && result.chartData) result.chartData.id = state.nextId++;
+    if (result.type === "multi") {
+      result.id = state.nextId++;
+      for (const item of result.items || []) {
+        if (item.type === "chart") item.id = state.nextId++;
       }
     }
-    return { type: "multi", title: intent.title || "", items, id: state.nextId++ };
-  }
-
-  // ── Execute intent Odoo ───────────────────────────────────────────────────
-  async function executeIntent(intent) {
-    const type      = intent.type || "query";
-    const modelName = intent.model || "";
-
-    if (type === "message") {
-      return { type: "message", content: intent.message || "" };
-    }
-
-    if (type === "multi") {
-      return executeMultiIntent(intent);
-    }
-
-    if (!modelName) return { type: "error", content: "Modèle non spécifié." };
-
-    const domain = intent.domain || [];
-
-    // COUNT
-    if (type === "count") {
-      const count = await odooCall(modelName, "search_count", { domain });
-      return { type: "count", value: count, title: intent.title || "Enregistrements" };
-    }
-
-    // SUM
-    if (type === "sum") {
-      const field = intent.field || intent.aggregation?.field || "amount_total";
-      const records = await odooCall(modelName, "search_read", {
-        domain, fields: [field], limit: 2000,
-      });
-      const total = records.reduce((acc, r) => acc + (r[field] || 0), 0);
-      return { type: "sum", value: total, title: intent.title || field, unit: intent.unit || "" };
-    }
-
-    // SYNTHESIS (tableau de bord)
-    if (type === "synthesis") {
-      const kpis = intent.kpis || [];
-      const results = await Promise.all(kpis.map(async (kpi) => {
-        try {
-          if (kpi.method === "count") {
-            const v = await odooCall(kpi.model, "search_count", { domain: kpi.domain || [] });
-            return { label: kpi.label, value: v, unit: "", valueType: "count" };
-          }
-          const field = kpi.field || "amount_total";
-          const recs = await odooCall(kpi.model, "search_read", {
-            domain: kpi.domain || [], fields: [field], limit: 2000,
-          });
-          const total = recs.reduce((acc, r) => acc + (r[field] || 0), 0);
-          return { label: kpi.label, value: total, unit: kpi.unit || "EUR", valueType: "sum" };
-        } catch (_) { return { label: kpi.label, value: null, unit: "", valueType: "error" }; }
-      }));
-
-      let chartData = null;
-      if (intent.chart) {
-        try { chartData = await buildChartData(intent.chart); } catch (_) {}
-      }
-      return { type: "synthesis", title: intent.title || "Synthèse", kpis: results, chartData, id: state.nextId++ };
-    }
-
-    // CHART
-    if (type === "chart") {
-      const groupby = intent.groupby || [];
-      if (!groupby.length) { intent.type = "query"; return executeIntent(intent); }
-      const chartData = await buildChartData(intent);
-      return { type: "chart", ...chartData, id: state.nextId++ };
-    }
-
-    // QUERY (liste)
-    const fields  = intent.fields || DEFAULT_FIELDS[modelName] || ["name"];
-    const labels  = intent.field_labels || {};
-    const orderby = intent.orderby || "id desc";
-    const limit   = Math.min(parseInt(intent.limit || 10, 10), 100);
-
-    const records = await odooCall(modelName, "search_read", {
-      domain, fields, order: orderby, limit,
-    });
-
-    const formatted = records.map((rec) => {
-      const row = {};
-      for (const [k, v] of Object.entries(rec)) {
-        row[k] = Array.isArray(v) && v.length === 2 && typeof v[0] === "number" ? v[1] : (v === false ? null : v);
-      }
-      return row;
-    });
-
-    return { type: "query", model: modelName, fields, field_labels: labels, records: formatted, total: formatted.length, title: intent.title || "" };
+    return result;
   }
 
   // ── Send message ──────────────────────────────────────────────────────────
@@ -411,7 +238,6 @@
     renderTyping(true);
 
     try {
-      // Appel proxy → intent Claude
       const proxyResp = await fetch(`${PROXY_URL}/api/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -424,30 +250,20 @@
 
       if (!proxyResp.ok) {
         let errMsg = `Erreur ${proxyResp.status}`;
-        try {
-          const errBody = await proxyResp.json();
-          errMsg = errBody.detail || errMsg;
-        } catch (_) {}
+        try { const b = await proxyResp.json(); errMsg = b.detail || errMsg; } catch (_) {}
         throw new Error(errMsg);
       }
 
-      const intent = await proxyResp.json();
+      let result = await proxyResp.json();
       renderTyping(false);
       state.loading = false;
 
-      if (intent.error) {
-        addMessage({ role: "bot", type: "error", content: intent.error, id: state.nextId++ });
+      if (result.error) {
+        addMessage({ role: "bot", type: "error", content: result.error, id: state.nextId++ });
         return;
       }
 
-      // Exécuter intent contre Odoo
-      let result;
-      try {
-        result = await executeIntent(intent);
-      } catch (ormErr) {
-        result = { type: "error", content: `Erreur Odoo : ${ormErr.message}` };
-      }
-
+      result = assignChartIds(result);
       const msgId = state.nextId++;
       addMessage({ role: "bot", id: msgId, ...result });
       state.history.push({ role: "assistant", content: summarize(result) });

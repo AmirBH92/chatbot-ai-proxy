@@ -13,3 +13,7 @@ services:
         value: https://chatbot.odoo.com
       - key: GEMINI_MODEL
         value: gemini-2.0-flash
+      - key: ODOO_URL
+        sync: false
+      - key: ODOO_API_KEY
+        sync: false
