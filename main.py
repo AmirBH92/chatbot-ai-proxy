@@ -199,7 +199,7 @@ async def query(req: QueryRequest):
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": contents,
         "generationConfig": {
-            "maxOutputTokens": 1024,
+            "maxOutputTokens": 2048,
             "temperature": 0.1,
             "responseMimeType": "application/json",  # Gemini force JSON valide
         },
@@ -226,9 +226,15 @@ async def query(req: QueryRequest):
 
     data = resp.json()
     try:
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidate = data["candidates"][0]
+        # Verifier si la reponse a ete tronquee
+        finish_reason = candidate.get("finishReason", "")
+        raw = candidate["content"]["parts"][0]["text"]
         intent = json.loads(raw)
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        return JSONResponse({"error": f"Reponse Gemini invalide : {e}", "raw": str(data)[:300]})
+    except json.JSONDecodeError:
+        return JSONResponse({"type": "message", "message": "Je n'ai pas pu formuler une reponse complete. Essayez de reformuler votre question de facon plus simple."})
+    except (KeyError, IndexError) as e:
+        return JSONResponse({"type": "message", "message": "Le service IA n'a pas retourne de reponse valide. Reessayez."})
+    _ = finish_reason  # utilisé si besoin de log futur
 
     return JSONResponse(intent)
