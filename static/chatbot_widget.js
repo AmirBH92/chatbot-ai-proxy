@@ -210,23 +210,29 @@
     renderWelcome();
   }
 
-  // ── Construit les données d'un chart depuis un intent chart ─────────────
+  // ── Construit les données d'un chart via search_read + agrégation JS ────
   async function buildChartData(c) {
-    const groupby  = c.groupby || [];
-    const field    = c.field || c.aggregation?.field || "amount_total";
-    const labelFld = groupby[0] || "id";
-    const groups   = await odooCall(c.model, "read_group", {
-      domain: c.domain || [], fields: [field], groupby, lazy: false,
+    const groupByField = (c.groupby || [])[0] || "state";
+    const field = c.field || "amount_total";
+    const records = await odooCall(c.model, "search_read", {
+      domain: c.domain || [], fields: [field, groupByField], limit: 1000,
     });
-    const labels = [], values = [];
-    for (const g of groups.slice(0, 15)) {
-      let lbl = g[labelFld] ?? "N/A";
+    const grouped = {};
+    for (const rec of records) {
+      let lbl = rec[groupByField];
       if (Array.isArray(lbl)) lbl = lbl[1] ?? lbl[0];
+      if (lbl === false || lbl === null || lbl === undefined) lbl = "Non défini";
+      lbl = String(lbl);
       if (STATE_LABELS[lbl]) lbl = STATE_LABELS[lbl];
-      labels.push(String(lbl));
-      values.push(Math.round((g[field] || 0) * 100) / 100);
+      grouped[lbl] = (grouped[lbl] || 0) + (rec[field] || 0);
     }
-    return { chart_type: c.chart_type || "bar", labels, values, title: c.title || "", x_label: c.x_label || "", y_label: c.y_label || "" };
+    const sorted = Object.entries(grouped).sort((a, b) => b[1] - a[1]).slice(0, 15);
+    return {
+      chart_type: c.chart_type || "bar",
+      labels: sorted.map(e => e[0]),
+      values: sorted.map(e => Math.round(e[1] * 100) / 100),
+      title: c.title || "", x_label: c.x_label || "", y_label: c.y_label || "",
+    };
   }
 
   // ── Execute intent Odoo ───────────────────────────────────────────────────
@@ -251,10 +257,10 @@
     // SUM
     if (type === "sum") {
       const field = intent.field || intent.aggregation?.field || "amount_total";
-      const groups = await odooCall(modelName, "read_group", {
-        domain, fields: [field], groupby: [], lazy: false,
+      const records = await odooCall(modelName, "search_read", {
+        domain, fields: [field], limit: 2000,
       });
-      const total = groups[0]?.[field] || 0;
+      const total = records.reduce((acc, r) => acc + (r[field] || 0), 0);
       return { type: "sum", value: total, title: intent.title || field, unit: intent.unit || "" };
     }
 
@@ -268,10 +274,11 @@
             return { label: kpi.label, value: v, unit: "", valueType: "count" };
           }
           const field = kpi.field || "amount_total";
-          const groups = await odooCall(kpi.model, "read_group", {
-            domain: kpi.domain || [], fields: [field], groupby: [], lazy: false,
+          const recs = await odooCall(kpi.model, "search_read", {
+            domain: kpi.domain || [], fields: [field], limit: 2000,
           });
-          return { label: kpi.label, value: groups[0]?.[field] || 0, unit: kpi.unit || "EUR", valueType: "sum" };
+          const total = recs.reduce((acc, r) => acc + (r[field] || 0), 0);
+          return { label: kpi.label, value: total, unit: kpi.unit || "EUR", valueType: "sum" };
         } catch (_) { return { label: kpi.label, value: null, unit: "", valueType: "error" }; }
       }));
 
