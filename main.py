@@ -99,6 +99,34 @@ SYSTEM_PROMPT_TPL = """Tu es un assistant analytique expert Odoo 19.3. Tu interp
   {{"label":"Clients actifs","model":"res.partner","method":"count","domain":[["customer_rank",">",0]]}}
 ],"chart":{{"chart_type":"bar","model":"sale.order","domain":[["state","in",["sale","done"]]],"groupby":["partner_id"],"field":"amount_total","title":"Top clients par CA"}}}}
 
+### multi — comparaisons / taux / croisements inter-modeles
+Utiliser quand la reponse necessite plusieurs requetes combinees.
+Chaque step a un "id" unique. Les steps suivants peuvent referencer un resultat precedent avec "$id".
+
+Types de steps : sum | count | collect | query | chart | calc
+- collect : recupere une liste de valeurs (ex: ids partenaires) pour filtrer une step suivante
+- calc : evalue une formule arithmetique avec les resultats precedents ($id)
+
+Exemple 1 — Comparaison temporelle :
+{{"type":"multi","title":"CA Juin vs Mai","steps":[
+  {{"id":"ca_juin","type":"sum","model":"sale.order","field":"amount_total","domain":[["state","in",["sale","done"]],["date_order",">=","{this_month}"]],"label":"CA Juin","unit":"EUR"}},
+  {{"id":"ca_mai","type":"sum","model":"sale.order","field":"amount_total","domain":[["state","in",["sale","done"]],["date_order",">=","{last_month}"],["date_order","<","{this_month}"]],"label":"CA Mai","unit":"EUR"}},
+  {{"id":"evol","type":"calc","formula":"($ca_juin - $ca_mai) / $ca_mai * 100","label":"Evolution","unit":"%"}}
+]}}
+
+Exemple 2 — Taux de conversion :
+{{"type":"multi","title":"Taux de conversion devis -> commande","steps":[
+  {{"id":"nb_total","type":"count","model":"sale.order","domain":[["state","!=","cancel"]],"label":"Devis crees"}},
+  {{"id":"nb_confirme","type":"count","model":"sale.order","domain":[["state","in",["sale","done"]]],"label":"Commandes confirmees"}},
+  {{"id":"taux","type":"calc","formula":"$nb_confirme / $nb_total * 100","label":"Taux de conversion","unit":"%"}}
+]}}
+
+Exemple 3 — Croisement inter-modeles :
+{{"type":"multi","title":"Clients actifs avec factures impayees","steps":[
+  {{"id":"partners_actifs","type":"collect","model":"sale.order","domain":[["state","in",["sale","done"]]],"field":"partner_id","display":false}},
+  {{"id":"impayees","type":"query","model":"account.move","domain":[["move_type","=","out_invoice"],["state","=","posted"],["payment_state","!=","paid"],["partner_id","in","$partners_actifs"]],"fields":["partner_id","name","amount_residual","invoice_date"],"field_labels":{{"partner_id":"Client","name":"Facture","amount_residual":"Montant Du","invoice_date":"Date"}},"label":"Factures impayees","orderby":"amount_residual desc","limit":20}}
+]}}
+
 ### message — hors perimetre Odoo
 {{"type":"message","message":"Je reponds uniquement aux questions sur vos donnees Odoo."}}
 
@@ -116,6 +144,8 @@ SYSTEM_PROMPT_TPL = """Tu es un assistant analytique expert Odoo 19.3. Tu interp
 - "liste" / "affiche" / "voir" / "quels" → query (limit 10)
 - "par X" / "repartition" / "graphique" / "evolution" → chart (chart_type adapte : bar pour comparaison, line pour tendance, pie pour repartition)
 - "tableau de bord" / "synthese" / "bilan" / "vue d'ensemble" → synthesis avec 4 KPIs + un chart pertinent
+- "vs" / "par rapport" / "evolution" / "taux" / "ratio" / "comparaison" / "progression" → multi
+- "clients qui ont X ET Y" / croisement entre 2 modeles → multi avec collect puis query
 
 ## Labels metier FR (toujours dans field_labels)
 

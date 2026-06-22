@@ -235,6 +235,80 @@
     };
   }
 
+  // ── Résout les références $step_id dans un domain ────────────────────────
+  function buildDomain(domain, ctx) {
+    return domain.map(cond => {
+      if (!Array.isArray(cond) || cond.length !== 3) return cond;
+      const [f, op, v] = cond;
+      if (typeof v === "string" && v.startsWith("$")) {
+        const ref = v.slice(1);
+        return [f, op, ctx[ref] ?? v];
+      }
+      return cond;
+    });
+  }
+
+  // ── Évalue une formule arithmétique simple ────────────────────────────────
+  function evalFormula(formula, ctx) {
+    let expr = formula;
+    for (const [k, v] of Object.entries(ctx)) {
+      if (typeof v === "number") expr = expr.replace(new RegExp("\\$" + k + "\\b", "g"), v);
+    }
+    if (!/^[\d+\-*/().\s]+$/.test(expr)) return 0;
+    try { return eval(expr); } catch { return 0; }
+  }
+
+  // ── Exécution multi-étapes ────────────────────────────────────────────────
+  async function executeMultiIntent(intent) {
+    const ctx   = {};   // résultats intermédiaires par id
+    const items = [];   // éléments à afficher
+
+    for (const step of (intent.steps || [])) {
+      const domain = buildDomain(step.domain || [], ctx);
+      const show   = step.display !== false;
+
+      if (step.type === "collect") {
+        const recs = await odooCall(step.model, "search_read", { domain, fields: [step.field], limit: 2000 });
+        ctx[step.id] = [...new Set(recs.map(r => {
+          const v = r[step.field]; return Array.isArray(v) ? v[0] : v;
+        }).filter(v => v !== false && v !== null && v !== undefined))].slice(0, 500);
+
+      } else if (step.type === "sum") {
+        const recs = await odooCall(step.model, "search_read", { domain, fields: [step.field], limit: 2000 });
+        const val  = recs.reduce((a, r) => a + (r[step.field] || 0), 0);
+        ctx[step.id] = val;
+        if (show) items.push({ type: "kpi", label: step.label, value: val, unit: step.unit || "EUR" });
+
+      } else if (step.type === "count") {
+        const val = await odooCall(step.model, "search_count", { domain });
+        ctx[step.id] = val;
+        if (show) items.push({ type: "kpi", label: step.label, value: val, unit: "" });
+
+      } else if (step.type === "calc") {
+        const val = evalFormula(step.formula, ctx);
+        ctx[step.id] = val;
+        if (show) items.push({ type: "calc", label: step.label, value: val, unit: step.unit || "" });
+
+      } else if (step.type === "query") {
+        const fields = step.fields || ["name"];
+        const recs   = await odooCall(step.model, "search_read", { domain, fields, order: step.orderby || "id desc", limit: step.limit || 15 });
+        const fmt_recs = recs.map(rec => {
+          const row = {};
+          for (const [k, v] of Object.entries(rec)) row[k] = Array.isArray(v) && v.length === 2 ? v[1] : (v === false ? null : v);
+          return row;
+        });
+        ctx[step.id] = fmt_recs;
+        if (show) items.push({ type: "query", title: step.label, fields, field_labels: step.field_labels || {}, records: fmt_recs, total: fmt_recs.length });
+
+      } else if (step.type === "chart") {
+        const cd = await buildChartData({ ...step, domain });
+        ctx[step.id] = cd;
+        if (show) items.push({ type: "chart", ...cd, id: state.nextId++ });
+      }
+    }
+    return { type: "multi", title: intent.title || "", items, id: state.nextId++ };
+  }
+
   // ── Execute intent Odoo ───────────────────────────────────────────────────
   async function executeIntent(intent) {
     const type      = intent.type || "query";
@@ -242,6 +316,10 @@
 
     if (type === "message") {
       return { type: "message", content: intent.message || "" };
+    }
+
+    if (type === "multi") {
+      return executeMultiIntent(intent);
     }
 
     if (!modelName) return { type: "error", content: "Modèle non spécifié." };
@@ -386,12 +464,82 @@
     }
   }
 
+  // ── Rendu multi ──────────────────────────────────────────────────────────
+  function appendMultiEl(container, msg) {
+    const d = el("div", "cbai-msg bot");
+    d.style.cssText = "max-width:100%;padding:10px;";
+
+    if (msg.title) {
+      const ttl = el("div");
+      ttl.style.cssText = "font-size:12px;font-weight:700;color:#CFE2F6;margin-bottom:10px;border-bottom:1px solid #1A2B48;padding-bottom:6px;";
+      ttl.textContent = msg.title; d.appendChild(ttl);
+    }
+
+    const kpis   = (msg.items || []).filter(i => i.type === "kpi" || i.type === "calc");
+    const others = (msg.items || []).filter(i => i.type !== "kpi" && i.type !== "calc");
+
+    if (kpis.length) {
+      const cols = Math.min(kpis.length, 3);
+      const grid = el("div");
+      grid.style.cssText = `display:grid;grid-template-columns:repeat(${cols},1fr);gap:8px;margin-bottom:10px;`;
+      for (const kpi of kpis) {
+        const card = el("div");
+        card.style.cssText = "background:#0C1226;border:1px solid #1A2B48;border-radius:8px;padding:8px 10px;";
+        const valEl = el("div");
+        valEl.style.cssText = "font-size:16px;font-weight:700;";
+        if (kpi.type === "calc" && kpi.unit === "%") {
+          const v = kpi.value, pos = v > 0;
+          valEl.style.color = v > 0 ? "#22C55E" : v < 0 ? "#EF4444" : "#7A9BC4";
+          valEl.textContent = (pos ? "↑ +" : v < 0 ? "↓ " : "→ ") + fmt(Math.abs(v)) + " %";
+        } else {
+          valEl.style.color = "#D4246E";
+          valEl.textContent = fmtVal(kpi.value, kpi.unit);
+        }
+        const lbl = el("div");
+        lbl.style.cssText = "font-size:10px;color:#7A9BC4;margin-top:2px;";
+        lbl.textContent = kpi.label;
+        card.appendChild(valEl); card.appendChild(lbl); grid.appendChild(card);
+      }
+      d.appendChild(grid);
+    }
+
+    for (const item of others) {
+      if (item.type === "query") {
+        if (item.title) {
+          const t = el("div"); t.style.cssText = "font-size:11px;font-weight:600;color:#CFE2F6;margin:8px 0 4px;"; t.textContent = item.title; d.appendChild(t);
+        }
+        const info = el("div"); info.style.cssText = "font-size:10px;color:#7A9BC4;margin-bottom:4px;"; info.textContent = `${item.total} résultat(s)`; d.appendChild(info);
+        const wrap = el("div", "cbai-table-wrap");
+        const table = el("table", "cbai-table");
+        const thead = el("thead"); const tr = el("tr");
+        for (const f of item.fields) { const th = el("th"); th.textContent = item.field_labels?.[f] || f; tr.appendChild(th); }
+        thead.appendChild(tr); table.appendChild(thead);
+        const tbody = el("tbody");
+        for (const rec of item.records) {
+          const row = el("tr");
+          for (const f of item.fields) { const td = el("td"); const v = fmtCell(rec[f], f); td.textContent = v; td.title = v; row.appendChild(td); }
+          tbody.appendChild(row);
+        }
+        table.appendChild(tbody); wrap.appendChild(table); d.appendChild(wrap);
+      } else if (item.type === "chart") {
+        if (item.title) {
+          const t = el("div"); t.style.cssText = "font-size:11px;font-weight:600;color:#CFE2F6;margin:8px 0 4px;text-align:center;"; t.textContent = item.title; d.appendChild(t);
+        }
+        const chartDiv = el("div", "cbai-chart"); const canvas = el("canvas");
+        canvas.id = `cbai-chart-${item.id}`; chartDiv.appendChild(canvas); d.appendChild(chartDiv);
+        setTimeout(() => renderChart(item), 50);
+      }
+    }
+    container.appendChild(d);
+  }
+
   function summarize(r) {
     if (r.type === "count")     return `${r.title} : ${r.value}.`;
     if (r.type === "sum")       return `${r.title} : ${fmtVal(r.value, r.unit)}.`;
     if (r.type === "query")     return `${r.title || ""} ${r.total} résultat(s).`;
     if (r.type === "chart")     return `Graphique "${r.title}" : ${r.labels?.length} données.`;
     if (r.type === "synthesis") return `Synthèse "${r.title}" : ${r.kpis?.length} indicateurs.`;
+    if (r.type === "multi")     return `Analyse "${r.title}" : ${r.items?.length} résultats.`;
     return r.content || "";
   }
 
@@ -500,6 +648,11 @@
         setTimeout(() => renderChart({ ...msg.chartData, id: msg.id }), 50);
       }
       container.appendChild(d);
+      return;
+    }
+
+    if (msg.type === "multi") {
+      appendMultiEl(container, msg);
       return;
     }
   }
