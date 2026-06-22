@@ -112,9 +112,35 @@
     return e;
   }
 
+  const STATE_LABELS = {
+    draft:"Devis", sent:"Envoyé", sale:"Confirmée", done:"Livrée/Terminée", cancel:"Annulée",
+    posted:"Validée", open:"En cours", won:"Gagné", lost:"Perdu",
+    in_progress:"En cours", new:"Nouveau", waiting:"En attente", ready:"Prêt",
+  };
+
   function fmt(v) {
     if (typeof v !== "number") return String(v ?? "");
     return new Intl.NumberFormat("fr-FR", { maximumFractionDigits: 2 }).format(v);
+  }
+
+  function fmtVal(v, unit) {
+    if (typeof v !== "number") return String(v ?? "");
+    if (unit === "EUR" || unit === "€") {
+      return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 0 }).format(v);
+    }
+    if (unit === "%") return fmt(v) + " %";
+    return fmt(v) + (unit ? " " + unit : "");
+  }
+
+  function fmtCell(v, fieldName) {
+    if (v === null || v === undefined || v === false) return "—";
+    if (typeof v === "boolean") return v ? "Oui" : "Non";
+    if (fieldName === "state" && STATE_LABELS[v]) return STATE_LABELS[v];
+    if ((fieldName === "amount_total" || fieldName === "price_subtotal" || fieldName === "amount_residual" || fieldName === "price_unit") && typeof v === "number") {
+      return new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 2 }).format(v);
+    }
+    if (typeof v === "number") return fmt(v);
+    return String(v);
   }
 
   // ── Odoo API (browser session via /web/dataset/call_kw) ──────────────────
@@ -184,6 +210,25 @@
     renderWelcome();
   }
 
+  // ── Construit les données d'un chart depuis un intent chart ─────────────
+  async function buildChartData(c) {
+    const groupby  = c.groupby || [];
+    const field    = c.field || c.aggregation?.field || "amount_total";
+    const labelFld = groupby[0] || "id";
+    const groups   = await odooCall(c.model, "read_group", {
+      domain: c.domain || [], fields: [field], groupby, lazy: false,
+    });
+    const labels = [], values = [];
+    for (const g of groups.slice(0, 15)) {
+      let lbl = g[labelFld] ?? "N/A";
+      if (Array.isArray(lbl)) lbl = lbl[1] ?? lbl[0];
+      if (STATE_LABELS[lbl]) lbl = STATE_LABELS[lbl];
+      labels.push(String(lbl));
+      values.push(Math.round((g[field] || 0) * 100) / 100);
+    }
+    return { chart_type: c.chart_type || "bar", labels, values, title: c.title || "", x_label: c.x_label || "", y_label: c.y_label || "" };
+  }
+
   // ── Execute intent Odoo ───────────────────────────────────────────────────
   async function executeIntent(intent) {
     const type      = intent.type || "query";
@@ -200,85 +245,70 @@
     // COUNT
     if (type === "count") {
       const count = await odooCall(modelName, "search_count", { domain });
-      return { type: "count", value: count, label: modelName };
+      return { type: "count", value: count, title: intent.title || "Enregistrements" };
     }
 
     // SUM
     if (type === "sum") {
-      const field   = intent.aggregation?.field || "amount_total";
-      const records = await odooCall(modelName, "search_read", {
-        domain,
-        fields: [field],
-        limit: 500,
+      const field = intent.field || intent.aggregation?.field || "amount_total";
+      const groups = await odooCall(modelName, "read_group", {
+        domain, fields: [field], groupby: [], lazy: false,
       });
-      const total = records.reduce((acc, r) => acc + (r[field] || 0), 0);
-      return { type: "sum", value: total, field };
+      const total = groups[0]?.[field] || 0;
+      return { type: "sum", value: total, title: intent.title || field, unit: intent.unit || "" };
+    }
+
+    // SYNTHESIS (tableau de bord)
+    if (type === "synthesis") {
+      const kpis = intent.kpis || [];
+      const results = await Promise.all(kpis.map(async (kpi) => {
+        try {
+          if (kpi.method === "count") {
+            const v = await odooCall(kpi.model, "search_count", { domain: kpi.domain || [] });
+            return { label: kpi.label, value: v, unit: "", valueType: "count" };
+          }
+          const field = kpi.field || "amount_total";
+          const groups = await odooCall(kpi.model, "read_group", {
+            domain: kpi.domain || [], fields: [field], groupby: [], lazy: false,
+          });
+          return { label: kpi.label, value: groups[0]?.[field] || 0, unit: kpi.unit || "EUR", valueType: "sum" };
+        } catch (_) { return { label: kpi.label, value: null, unit: "", valueType: "error" }; }
+      }));
+
+      let chartData = null;
+      if (intent.chart) {
+        try { chartData = await buildChartData(intent.chart); } catch (_) {}
+      }
+      return { type: "synthesis", title: intent.title || "Synthèse", kpis: results, chartData, id: state.nextId++ };
     }
 
     // CHART
     if (type === "chart") {
-      const groupby   = intent.groupby || [];
-      const aggField  = intent.aggregation?.field || "amount_total";
-      const labelField = intent.chart_label_field || (groupby[0] || "id");
-
-      if (!groupby.length) {
-        intent.type = "query";
-        return executeIntent(intent);
-      }
-
-      const groups = await odooCall(modelName, "read_group", {
-        domain,
-        fields: [aggField],
-        groupby,
-        lazy: false,
-      });
-
-      const labels = [], values = [];
-      for (const g of groups.slice(0, 30)) {
-        let lbl = g[labelField] ?? "N/A";
-        if (Array.isArray(lbl)) lbl = lbl[1] ?? lbl[0];
-        labels.push(String(lbl));
-        values.push(Math.round((g[aggField] || 0) * 100) / 100);
-      }
-
-      return {
-        type: "chart",
-        chart_type: intent.chart_type || "bar",
-        labels,
-        values,
-        value_label: aggField,
-        id: state.nextId++,
-      };
+      const groupby = intent.groupby || [];
+      if (!groupby.length) { intent.type = "query"; return executeIntent(intent); }
+      const chartData = await buildChartData(intent);
+      return { type: "chart", ...chartData, id: state.nextId++ };
     }
 
     // QUERY (liste)
     const fields  = intent.fields || DEFAULT_FIELDS[modelName] || ["name"];
+    const labels  = intent.field_labels || {};
     const orderby = intent.orderby || "id desc";
-    const limit   = Math.min(parseInt(intent.limit || 40, 10), 100);
+    const limit   = Math.min(parseInt(intent.limit || 10, 10), 100);
 
     const records = await odooCall(modelName, "search_read", {
-      domain,
-      fields,
-      order: orderby,
-      limit,
+      domain, fields, order: orderby, limit,
     });
 
-    // Formater many2one
     const formatted = records.map((rec) => {
       const row = {};
       for (const [k, v] of Object.entries(rec)) {
-        if (Array.isArray(v) && v.length === 2 && typeof v[0] === "number") {
-          row[k] = v[1];
-        } else if (v === false) {
-          row[k] = "";
-        } else {
-          row[k] = v;
-        }
+        row[k] = Array.isArray(v) && v.length === 2 && typeof v[0] === "number" ? v[1] : (v === false ? null : v);
       }
       return row;
     });
 
-    return { type: "query", model: modelName, fields, records: formatted, total: formatted.length };
+    return { type: "query", model: modelName, fields, field_labels: labels, records: formatted, total: formatted.length, title: intent.title || "" };
   }
 
   // ── Send message ──────────────────────────────────────────────────────────
@@ -350,10 +380,11 @@
   }
 
   function summarize(r) {
-    if (r.type === "count")   return `${r.value} enregistrement(s).`;
-    if (r.type === "sum")     return `Total ${r.field} : ${r.value}.`;
-    if (r.type === "query")   return `${r.total} enregistrement(s).`;
-    if (r.type === "chart")   return `Graphique : ${r.labels?.length} données.`;
+    if (r.type === "count")     return `${r.title} : ${r.value}.`;
+    if (r.type === "sum")       return `${r.title} : ${fmtVal(r.value, r.unit)}.`;
+    if (r.type === "query")     return `${r.title || ""} ${r.total} résultat(s).`;
+    if (r.type === "chart")     return `Graphique "${r.title}" : ${r.labels?.length} données.`;
+    if (r.type === "synthesis") return `Synthèse "${r.title}" : ${r.kpis?.length} indicateurs.`;
     return r.content || "";
   }
 
@@ -391,14 +422,14 @@
 
     if (msg.type === "count") {
       const d = el("div", "cbai-msg bot");
-      d.innerHTML = `<div class="cbai-big"><div class="n">${msg.value}</div><div class="lbl">${msg.label || ""}</div></div>`;
+      d.innerHTML = `<div class="cbai-big"><div class="n">${fmt(msg.value)}</div><div class="lbl">${msg.title || ""}</div></div>`;
       container.appendChild(d);
       return;
     }
 
     if (msg.type === "sum") {
       const d = el("div", "cbai-msg bot");
-      d.innerHTML = `<div class="cbai-big"><div class="n">${fmt(msg.value)}</div><div class="lbl">${msg.field || ""}</div></div>`;
+      d.innerHTML = `<div class="cbai-big"><div class="n">${fmtVal(msg.value, msg.unit)}</div><div class="lbl">${msg.title || ""}</div></div>`;
       container.appendChild(d);
       return;
     }
@@ -406,37 +437,26 @@
     if (msg.type === "query") {
       const d = el("div", "cbai-msg bot");
       d.style.cssText = "max-width:100%;padding:10px 10px 8px;";
-      const info = el("div");
-      info.style.cssText = "font-size:10px;color:#7A9BC4;margin-bottom:4px;";
-      info.textContent = `${msg.total} résultat(s)`;
+      if (msg.title) {
+        const ttl = el("div"); ttl.style.cssText = "font-size:11px;font-weight:600;color:#CFE2F6;margin-bottom:6px;"; ttl.textContent = msg.title; d.appendChild(ttl);
+      }
+      const info = el("div"); info.style.cssText = "font-size:10px;color:#7A9BC4;margin-bottom:4px;"; info.textContent = `${msg.total} résultat(s)`; d.appendChild(info);
       const wrap = el("div", "cbai-table-wrap");
       const table = el("table", "cbai-table");
-      // Header
-      const thead = el("thead");
-      const tr = el("tr");
+      const thead = el("thead"); const tr = el("tr");
       for (const f of msg.fields) {
-        const th = el("th");
-        th.textContent = f;
-        tr.appendChild(th);
+        const th = el("th"); th.textContent = msg.field_labels?.[f] || f; tr.appendChild(th);
       }
-      thead.appendChild(tr);
-      table.appendChild(thead);
-      // Body
+      thead.appendChild(tr); table.appendChild(thead);
       const tbody = el("tbody");
       for (const rec of msg.records) {
         const row = el("tr");
         for (const f of msg.fields) {
-          const td = el("td");
-          td.textContent = rec[f] != null ? String(rec[f]) : "";
-          td.title = td.textContent;
-          row.appendChild(td);
+          const td = el("td"); const val = fmtCell(rec[f], f); td.textContent = val; td.title = val; row.appendChild(td);
         }
         tbody.appendChild(row);
       }
-      table.appendChild(tbody);
-      wrap.appendChild(table);
-      d.appendChild(info);
-      d.appendChild(wrap);
+      table.appendChild(tbody); wrap.appendChild(table); d.appendChild(wrap);
       container.appendChild(d);
       return;
     }
@@ -444,14 +464,35 @@
     if (msg.type === "chart") {
       const d = el("div", "cbai-msg bot");
       d.style.cssText = "max-width:100%;padding:10px;";
-      const chartDiv = el("div", "cbai-chart");
-      const canvas = el("canvas");
-      canvas.id = `cbai-chart-${msg.id}`;
-      chartDiv.appendChild(canvas);
-      d.appendChild(chartDiv);
+      if (msg.title) {
+        const ttl = el("div"); ttl.style.cssText = "font-size:11px;font-weight:600;color:#CFE2F6;margin-bottom:6px;text-align:center;"; ttl.textContent = msg.title; d.appendChild(ttl);
+      }
+      const chartDiv = el("div", "cbai-chart"); const canvas = el("canvas"); canvas.id = `cbai-chart-${msg.id}`; chartDiv.appendChild(canvas); d.appendChild(chartDiv);
       container.appendChild(d);
-      // Rendre le graphique après insertion DOM
       setTimeout(() => renderChart(msg), 50);
+      return;
+    }
+
+    if (msg.type === "synthesis") {
+      const d = el("div", "cbai-msg bot");
+      d.style.cssText = "max-width:100%;padding:10px;";
+      if (msg.title) {
+        const ttl = el("div"); ttl.style.cssText = "font-size:12px;font-weight:700;color:#CFE2F6;margin-bottom:10px;border-bottom:1px solid #1A2B48;padding-bottom:6px;"; ttl.textContent = msg.title; d.appendChild(ttl);
+      }
+      const grid = el("div"); grid.style.cssText = "display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;";
+      for (const kpi of msg.kpis || []) {
+        const card = el("div"); card.style.cssText = "background:#0C1226;border:1px solid #1A2B48;border-radius:8px;padding:8px 10px;";
+        const val = el("div"); val.style.cssText = "font-size:16px;font-weight:700;color:#D4246E;";
+        val.textContent = kpi.value === null ? "—" : fmtVal(kpi.value, kpi.unit);
+        const lbl = el("div"); lbl.style.cssText = "font-size:10px;color:#7A9BC4;margin-top:2px;"; lbl.textContent = kpi.label;
+        card.appendChild(val); card.appendChild(lbl); grid.appendChild(card);
+      }
+      d.appendChild(grid);
+      if (msg.chartData) {
+        const chartDiv = el("div", "cbai-chart"); const canvas = el("canvas"); canvas.id = `cbai-chart-${msg.id}`; chartDiv.appendChild(canvas); d.appendChild(chartDiv);
+        setTimeout(() => renderChart({ ...msg.chartData, id: msg.id }), 50);
+      }
+      container.appendChild(d);
       return;
     }
   }
@@ -502,7 +543,7 @@
       type: msg.chart_type || "bar",
       data: {
         labels: msg.labels || [],
-        datasets: [{ label: msg.value_label || "Valeur", data: msg.values || [], backgroundColor: bg, borderColor: border, borderWidth: 1.5 }],
+        datasets: [{ label: msg.y_label || msg.value_label || "Valeur", data: msg.values || [], backgroundColor: bg, borderColor: border, borderWidth: 1.5 }],
       },
       options: {
         responsive: true, maintainAspectRatio: false,
